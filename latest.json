@@ -1,7 +1,7 @@
 {
   "version": "1.3.0",
-  "downloadUrl": "https://raw.githubusercontent.com/XyrooNotDev/santanic-build-update/main/santanic-v1.2.2.apk",
-  "desk": "Fitur update otomatis, Tab Status Build, dan perbaikan bug minor",
-  "publishedAt": "20-11-2026 14:00",
+  "downloadUrl": "santanic-v1.3.0.apk",
+  "desk": "Fitur baru: Analyzer Project. Perubahan: ganti icon aplikasi, ganti domain, dan rename all.",
+  "publishedAt": "20-11-2026 14:05",
   "forceUpdate": true
 }
