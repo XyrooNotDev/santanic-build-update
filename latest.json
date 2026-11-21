@@ -1,7 +1,7 @@
 {
-  "version": "1.4.0",
-  "downloadUrl": "santanic-v1.4.0.apk",
-  "desk": "Fitur baru: Analyzer Project. Perubahan: ganti icon aplikasi, ganti domain, dan rename all.",
-  "publishedAt": "21-11-2026 15:40",
+  "version": "1.5.0",
+  "downloadUrl": "santanic-v1.5.0.apk",
+  "desk": "Fitur baru: Log Terminal Live, Splash Screen, Tampilan History Build Berhasil New.",
+  "publishedAt": "22-11-2026 01:20",
   "forceUpdate": true
 }
