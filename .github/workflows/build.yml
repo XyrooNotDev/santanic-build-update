@@ -1,0 +1,408 @@
+name: Santanic Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_zip:
+        description: "Nama ZIP project yang diupload dari aplikasi"
+        required: false
+        default: "source.zip"
+        type: string
+      require_signing:
+        description: "Wajibkan release keystore (gagal kalau secret kosong)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      REQUIRE_RELEASE_SIGNING: ${{ inputs.require_signing }}
+      FLUTTER_VERSION: '3.41.9'      # ← ubah di sini kalau mau versi lain
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Extract uploaded project ZIP
+        shell: bash
+        run: |
+          ZIP_NAME="${{ inputs.source_zip }}"
+          test -f "$ZIP_NAME" || { echo "::error::File $ZIP_NAME tidak ditemukan."; exit 1; }
+          mkdir -p _santanic_source
+          unzip -q "$ZIP_NAME" -d _santanic_source
+          PROJECT_ROOT="$(find _santanic_source -name pubspec.yaml -printf '%h\n' | head -n 1)"
+          if [ -z "$PROJECT_ROOT" ]; then
+            PROJECT_ROOT="$(find _santanic_source -name gradlew -printf '%h\n' | head -n 1)"
+          fi
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "::error::ZIP tidak berisi pubspec.yaml atau gradlew"
+            exit 1
+          fi
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Sumber project ditemukan: $PROJECT_ROOT"
+
+      - name: Install Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.gradle/init.d
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Prepare Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # =============================================================
+      # MIRROR — versi aman untuk Gradle 8+ (fix FAIL_ON_PROJECT_REPOS)
+      # =============================================================
+      - name: Install Gradle Maven mirror (anti 429, Gradle 8+ safe)
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/00-santanic-mirror.gradle" <<'GRADLE_EOF'
+          def mirrors = [
+              'https://maven-central.storage-download.googleapis.com/maven2/',
+              'https://maven.aliyun.com/repository/central',
+              'https://maven.aliyun.com/repository/gradle-plugin',
+              'https://maven.aliyun.com/repository/public',
+          ]
+
+          beforeSettings { settings ->
+              try {
+                  settings.dependencyResolutionManagement.repositoriesMode.set(
+                      org.gradle.api.initialization.resolve.RepositoriesMode.PREFER_SETTINGS
+                  )
+              } catch (Throwable ignored) { }
+
+              try {
+                  settings.pluginManagement.repositories { repos ->
+                      mirrors.each { u -> repos.maven { url u } }
+                  }
+              } catch (Throwable t) {
+                  println "[santanic-mirror] pluginManagement: ${t.message}"
+              }
+
+              try {
+                  settings.dependencyResolutionManagement.repositories { repos ->
+                      mirrors.each { u -> repos.maven { url u } }
+                  }
+              } catch (Throwable t) {
+                  println "[santanic-mirror] dependencyResolutionManagement: ${t.message}"
+              }
+          }
+
+          allprojects { proj ->
+              try {
+                  proj.buildscript.repositories { repos ->
+                      mirrors.each { u -> repos.maven { url u } }
+                  }
+              } catch (Throwable ignored) { }
+          }
+          GRADLE_EOF
+          echo "Mirror Gradle terpasang:"
+          ls -la "$HOME/.gradle/init.d/"
+
+      - name: Configure Gradle retry & timeout
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle"
+          cat >> "$HOME/.gradle/gradle.properties" <<'EOF'
+          org.gradle.internal.http.connectionTimeout=120000
+          org.gradle.internal.http.socketTimeout=120000
+          systemProp.org.gradle.internal.repository.max.retries=5
+          systemProp.org.gradle.internal.repository.initial.backoff=2000
+          systemProp.org.gradle.internal.repository.max.backoff=60000
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          org.gradle.daemon=false
+          EOF
+
+      - name: Copy project into workspace
+        shell: bash
+        run: |
+          cp -a "$PROJECT_ROOT"/. .
+          echo "Files copied from uploaded ZIP"
+
+      # =============================================================
+      # SAFETY: kalau project minta Gradle < versi minimum Flutter,
+      # naikkan wrapper otomatis (fallback kalau FLUTTER_VERSION diubah
+      # ke 3.50+ nanti). Untuk 3.41.9 ini biasanya no-op.
+      # =============================================================
+      - name: Ensure Gradle wrapper compatible with Flutter ${{ env.FLUTTER_VERSION }}
+        shell: bash
+        run: |
+          PROPS=android/gradle/wrapper/gradle-wrapper.properties
+          if [ ! -f "$PROPS" ]; then
+            echo "::warning::$PROPS tidak ada, skip."
+            exit 0
+          fi
+          CURRENT=$(grep -E '^distributionUrl=' "$PROPS" | sed -E 's#.*/gradle-([0-9.]+)-.*#\1#' | head -n1)
+          echo "Gradle wrapper saat ini: $CURRENT"
+          MIN="8.14"
+          if [ -z "$CURRENT" ]; then
+            echo "::warning::Tidak bisa baca versi, paksa 8.14.3"
+            sed -i -E 's#^distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.3-bin.zip#' "$PROPS"
+          elif [ "$(printf '%s\n' "$MIN" "$CURRENT" | sort -V | head -n1)" = "$CURRENT" ] && [ "$CURRENT" != "$MIN" ]; then
+            echo "→ Gradle di bawah $MIN, upgrade ke 8.14.3"
+            sed -i -E 's#^distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.3-bin.zip#' "$PROPS"
+          else
+            echo "→ Gradle OK."
+          fi
+          cat "$PROPS"
+
+      # =============================================================
+      # RESTORE RELEASE KEYSTORE
+      # =============================================================
+      - name: Restore signing keystore
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          REQUIRE_SIGNING: ${{ env.REQUIRE_RELEASE_SIGNING }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            if [ "$REQUIRE_SIGNING" = "true" ]; then
+              echo "::error::KEYSTORE_BASE64 kosong tapi require_signing=true. Build dibatalkan."
+              exit 1
+            fi
+            echo "::warning::KEYSTORE_BASE64 kosong. Menggunakan debug keystore (SHA-1 akan BERUBAH)."
+            exit 0
+          fi
+          mkdir -p "$HOME/.santanic-keys"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$HOME/.santanic-keys/santanic-release.jks"
+          echo "KEYSTORE_PATH=$HOME/.santanic-keys/santanic-release.jks" >> "$GITHUB_ENV"
+          echo "Keystore restored."
+
+      - name: Configure release signing
+        if: hashFiles('pubspec.yaml') != '' && env.KEYSTORE_PATH != ''
+        shell: bash
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ ! -f android/app/build.gradle ]; then
+            echo "::warning::build.gradle tidak ditemukan, skip."
+            exit 0
+          fi
+          cat > android/key.properties <<EOF
+          storePassword=${KEYSTORE_PASSWORD}
+          keyPassword=${KEY_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          storeFile=${KEYSTORE_PATH}
+          EOF
+
+          sed -i "/apply plugin: 'com.android.application'/a \\
+          def keystoreProperties = new Properties()\\n\\
+          def keystorePropertiesFile = rootProject.file('key.properties')\\n\\
+          if (keystorePropertiesFile.exists()) {\\n\\
+              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\\n\\
+          }" android/app/build.gradle
+
+          sed -i "/android {/a \\
+              signingConfigs {\\n\\
+                  release {\\n\\
+                      keyAlias keystoreProperties['keyAlias']\\n\\
+                      keyPassword keystoreProperties['keyPassword']\\n\\
+                      storeFile file(keystoreProperties['storeFile'])\\n\\
+                      storePassword keystoreProperties['storePassword']\\n\\
+                  }\\n\\
+              }" android/app/build.gradle
+
+          sed -i "/release {/a \\
+                      signingConfig signingConfigs.release" android/app/build.gradle
+          echo "Signing config berhasil disuntikkan."
+
+      # =============================================================
+      # BUILD FLUTTER — retry 5x + fallback tanpa split
+      # =============================================================
+      - name: Build Flutter APK
+        if: hashFiles('pubspec.yaml') != ''
+        shell: bash
+        run: |
+          flutter --version
+          retry() {
+            n=1
+            until "$@"; do
+              if [ "$n" -ge 5 ]; then return 1; fi
+              echo "::warning::Percobaan $n gagal, mengulang dalam $((n*30)) detik..."
+              sleep $((n*30))
+              n=$((n+1))
+            done
+          }
+          retry flutter pub get
+          if retry flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 --split-debug-info=build/symbols; then
+            echo "✅ Build split-per-abi berhasil."
+          else
+            echo "::warning::Build split-per-abi gagal, mencoba build biasa."
+            retry flutter build apk --release --split-debug-info=build/symbols
+          fi
+
+      - name: Build Android Studio APK
+        if: hashFiles('pubspec.yaml') == '' && hashFiles('gradlew') != ''
+        shell: bash
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          chmod +x ./gradlew
+          if [ -n "$KEYSTORE_PATH" ]; then
+            cat > key.properties <<EOF
+          storePassword=${KEYSTORE_PASSWORD}
+          keyPassword=${KEY_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          storeFile=${KEYSTORE_PATH}
+          EOF
+          fi
+          ./gradlew assembleRelease --stacktrace
+
+      # =============================================================
+      # FINGERPRINT — print + verifikasi + simpan permanen
+      # =============================================================
+      - name: Print & verify SHA fingerprint
+        id: fp
+        shell: bash
+        env:
+          EXPECTED_SHA256: ${{ secrets.EXPECTED_SHA256 }}
+        run: |
+          echo "=================================================="
+          echo "     SIGNING KEY FINGERPRINT"
+          echo "=================================================="
+          if [ -n "$KEYSTORE_PATH" ]; then
+            keytool -list -v -keystore "$KEYSTORE_PATH" \
+              -alias "${{ secrets.KEY_ALIAS }}" \
+              -storepass "${{ secrets.KEYSTORE_PASSWORD }}" | tee /tmp/fingerprint.txt
+            SHA1=$(grep "SHA1:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA1: //' | tr -d ' ')
+            SHA256=$(grep "SHA256:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA256: //' | tr -d ' ')
+            SOURCE="release-keystore"
+          else
+            echo "::warning::Menggunakan Debug Keystore (SHA tidak persisten)."
+            keytool -list -v -keystore "$HOME/.android/debug.keystore" \
+              -alias androiddebugkey -storepass android -keypass android | tee /tmp/fingerprint.txt
+            SHA1=$(grep "SHA1:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA1: //' | tr -d ' ')
+            SHA256=$(grep "SHA256:" /tmp/fingerprint.txt | head -n1 | sed 's/.*SHA256: //' | tr -d ' ')
+            SOURCE="debug-keystore"
+          fi
+
+          echo "::notice title=SHA-1::$SHA1"
+          echo "::notice title=SHA-256::$SHA256"
+          echo "::notice title=Source::$SOURCE"
+
+          if [ -n "$EXPECTED_SHA256" ]; then
+            EXPECTED_NORM=$(echo "$EXPECTED_SHA256" | tr '[:lower:]' '[:upper:]' | tr -d ':')
+            ACTUAL_NORM=$(echo "$SHA256" | tr '[:lower:]' '[:upper:]' | tr -d ':')
+            if [ "$EXPECTED_NORM" != "$ACTUAL_NORM" ]; then
+              echo "::error::SHA-256 TIDAK COCOK!"
+              echo "   Expected : $EXPECTED_SHA256"
+              echo "   Actual   : $SHA256"
+              echo "   Sumber   : $SOURCE"
+              exit 1
+            fi
+            echo "✅ SHA-256 cocok dengan EXPECTED_SHA256 secret."
+          else
+            echo "::warning::EXPECTED_SHA256 tidak diisi — verifikasi dilewati."
+          fi
+
+          echo "SHA1=$SHA1" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+          echo "FP_SOURCE=$SOURCE" >> "$GITHUB_ENV"
+
+          mkdir -p santanic-output
+          {
+            echo "source=$SOURCE"
+            echo "sha1=$SHA1"
+            echo "sha256=$SHA256"
+          } > santanic-output/fingerprint.txt
+
+      - name: Commit fingerprint to repo (permanen)
+        if: env.KEYSTORE_PATH != '' && env.SHA256 != ''
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p docs
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          SHA1="${{ env.SHA1 }}"
+          SHA256="${{ env.SHA256 }}"
+          SRC="${{ env.FP_SOURCE }}"
+          BUILD_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          cat > docs/fingerprint.md <<EOF
+          # Santanic App — Signing Fingerprint
+
+          Fingerprint ini **stabil permanen** selama \`KEYSTORE_BASE64\` di GitHub Secrets tidak diubah.
+
+          | Field | Nilai |
+          |---|---|
+          | **SHA-1** | \`${SHA1}\` |
+          | **SHA-256** | \`${SHA256}\` |
+          | Alias | \`${{ secrets.KEY_ALIAS }}\` |
+          | Sumber | \`${SRC}\` |
+          | Terakhir update | \`${TS}\` |
+          | Build | [lihat log](${BUILD_URL}) |
+
+          > ⚠️ Jangan mengubah isi file ini secara manual.
+          EOF
+
+          git config user.name  "Santanic Bot"
+          git config user.email "bot@santanic.local"
+          git add docs/fingerprint.md
+          if git diff --staged --quiet; then
+            echo "Tidak ada perubahan fingerprint. Skip commit."
+          else
+            git commit -m "chore(fingerprint): update signing fingerprint [skip ci]"
+            git push
+            echo "✅ docs/fingerprint.md diperbarui di repo."
+          fi
+
+      # =============================================================
+      # COLLECT & UPLOAD
+      # =============================================================
+      - name: Collect APK
+        shell: bash
+        run: |
+          mkdir -p santanic-output
+          find . -type f -name '*.apk' -path '*/outputs/*' -not -path './santanic-output/*' -exec cp {} santanic-output/ \;
+          if [ -z "$(find santanic-output -name '*.apk' -print -quit)" ]; then
+            echo "::error::APK tidak ditemukan."
+            exit 1
+          fi
+          ls -lh santanic-output
+          for f in santanic-output/*.apk; do
+            SIZE=$(stat -c%s "$f")
+            echo "$(basename "$f"): $((SIZE / 1024 / 1024)) MB"
+          done
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Santanic-APK
+          path: |
+            santanic-output/*.apk
+            santanic-output/fingerprint.txt
+          if-no-files-found: error
+          retention-days: 90
